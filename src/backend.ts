@@ -13,6 +13,14 @@ export type Site = {
   last_changed: string | null;
   last_error: string | null;
   urls: string[];
+  discovered_urls: string[];
+  page_count: number;
+  checks: CheckRun[];
+};
+
+export type CheckRun = {
+  checked_at: string;
+  status: string;
   page_count: number;
 };
 
@@ -39,9 +47,11 @@ export type Settings = {
 };
 
 export type AppState = {
+  version?: string;
   summary: { total: number; active: number; changed: number; errors: number };
   sites: Site[];
   events: EventItem[];
+  updates: EventItem[];
   settings: Settings | null;
 };
 
@@ -52,8 +62,9 @@ export interface Backend {
   minInterval: number;
   intervalChoices: { value: number; label: string }[];
   loadState(): Promise<AppState>;
-  addSite(input: { name: string; url: string; interval_minutes: number }): Promise<void>;
+  addSite(input: { name: string; url: string; interval_minutes: number; discovery_depth: number }): Promise<void>;
   addPage(site: Site, url: string): Promise<void>;
+  setPages(site: Site, urls: string[]): Promise<void>;
   checkSite(site: Site): Promise<string>;
   checkAll(): Promise<string>;
   toggleSite(site: Site): Promise<void>;
@@ -69,6 +80,7 @@ export interface Backend {
 const LOCAL_BASE = window.location.hostname.endsWith("github.io")
   ? "http://127.0.0.1:8765"
   : "";
+const LOCAL_SERVER_VERSION = "1.2.7";
 
 async function localApi<T>(path: string, options?: RequestInit): Promise<T> {
   let response: Response;
@@ -99,10 +111,36 @@ export class LocalBackend implements Backend {
   ];
 
   async loadState(): Promise<AppState> {
-    return localApi<AppState>("/api/state");
+    const state = await localApi<AppState>("/api/state");
+    if (state.version !== LOCAL_SERVER_VERSION) {
+      throw new Error(
+        `ローカルサーバーが古いバージョンです（起動中: ${state.version || "旧版"}、必要: ${LOCAL_SERVER_VERSION}）。start.command をもう一度実行してください。`,
+      );
+    }
+    // The UI can be newer than a still-running local server after an update.
+    // Treat absent newer fields as legacy data instead of crashing on expand.
+    return {
+      ...state,
+      sites: state.sites.map((site) => {
+        const urls = Array.isArray(site.urls) && site.urls.length ? site.urls : [site.url];
+        return {
+          ...site,
+          urls,
+          discovered_urls: Array.isArray(site.discovered_urls) && site.discovered_urls.length
+            ? site.discovered_urls
+            : urls,
+          page_count: site.page_count || urls.length,
+          checks: Array.isArray(site.checks)
+            ? site.checks
+            : site.last_checked
+              ? [{ checked_at: site.last_checked, status: site.status || "unchanged", page_count: site.page_count || 1 }]
+              : [],
+        };
+      }),
+    };
   }
 
-  async addSite(input: { name: string; url: string; interval_minutes: number }): Promise<void> {
+  async addSite(input: { name: string; url: string; interval_minutes: number; discovery_depth: number }): Promise<void> {
     await localApi("/api/sites", { method: "POST", body: JSON.stringify(input) });
   }
 
@@ -110,6 +148,13 @@ export class LocalBackend implements Backend {
     await localApi(`/api/sites/${site.id}/pages`, {
       method: "POST",
       body: JSON.stringify({ url }),
+    });
+  }
+
+  async setPages(site: Site, urls: string[]): Promise<void> {
+    await localApi(`/api/sites/${site.id}/pages`, {
+      method: "PUT",
+      body: JSON.stringify({ urls }),
     });
   }
 
@@ -192,6 +237,8 @@ type CloudSiteRecord = {
   interval_minutes: number;
   enabled: boolean;
   urls?: string[];
+  discovered_urls?: string[];
+  discovery_depth?: number;
   auto_discover?: boolean;
 };
 
@@ -201,6 +248,7 @@ type CloudStateEntry = {
   last_changed?: string;
   last_error?: string | null;
   content_hash?: string;
+  checks?: CheckRun[];
 };
 
 async function gh<T>(path: string, options?: RequestInit): Promise<T> {
@@ -245,7 +293,7 @@ async function ghRaw(path: string): Promise<string> {
     },
   });
   if (response.status === 401) throw new Error("トークンが無効です。右上の歯車から設定し直してください。");
-  if (response.status === 404) throw new Error("クラウドの監視履歴が見つかりません。");
+  if (response.status === 404) throw new Error("クラウドのモニター履歴が見つかりません。");
   if (!response.ok) throw new Error(`GitHub APIエラー (${response.status})`);
   return response.text();
 }
@@ -269,7 +317,7 @@ async function readSites(): Promise<{ sites: CloudSiteRecord[]; sha: string }> {
   return { sites: JSON.parse(decodeContent(file.content)), sha: file.sha };
 }
 
-async function readCloudState(): Promise<{ sites?: Record<string, CloudStateEntry>; events?: EventItem[] }> {
+async function readCloudState(): Promise<{ sites?: Record<string, CloudStateEntry>; events?: EventItem[]; updates?: EventItem[] }> {
   // Ask the Contents endpoint only for the blob SHA.  Its base64 body is
   // unavailable after 1 MB, while the Git Blob endpoint can return the same
   // object in raw form without the large-file Contents response limitation.
@@ -286,6 +334,25 @@ async function writeSites(sites: CloudSiteRecord[], sha: string, message: string
       sha,
     }),
   });
+}
+
+async function updateSites(
+  message: string,
+  update: (sites: CloudSiteRecord[]) => CloudSiteRecord[],
+): Promise<void> {
+  // A discovery workflow may finish between reading sites.json and writing a
+  // checkbox change. Re-read and retry instead of making the person repeat it.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const { sites, sha } = await readSites();
+    try {
+      await writeSites(update(sites), sha, message);
+      return;
+    } catch (error) {
+      const isConflict = error instanceof Error && error.message.includes("競合");
+      if (!isConflict || attempt === 2) throw error;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 400 * (attempt + 1)));
+    }
+  }
 }
 
 async function dispatchCheck(inputs: Record<string, string>): Promise<void> {
@@ -307,7 +374,7 @@ export class CloudBackend implements Backend {
 
   async loadState(): Promise<AppState> {
     const { sites } = await readSites();
-    let cloudState: { sites?: Record<string, CloudStateEntry>; events?: EventItem[] } = {};
+    let cloudState: { sites?: Record<string, CloudStateEntry>; events?: EventItem[]; updates?: EventItem[] } = {};
     try {
       cloudState = await readCloudState();
     } catch {
@@ -327,7 +394,13 @@ export class CloudBackend implements Backend {
         last_changed: entry.last_changed || null,
         last_error: entry.last_error || null,
         urls: site.urls?.length ? site.urls : [site.url],
+        discovered_urls: site.discovered_urls?.length ? site.discovered_urls : (site.urls?.length ? site.urls : [site.url]),
         page_count: site.urls?.length || 1,
+        checks: entry.checks?.length
+          ? entry.checks
+          : entry.last_checked
+            ? [{ checked_at: entry.last_checked, status: entry.status || "unchanged", page_count: site.urls?.length || 1 }]
+            : [],
       };
     });
     return {
@@ -339,18 +412,17 @@ export class CloudBackend implements Backend {
       },
       sites: merged,
       events: (cloudState.events || []).slice(0, 50),
+      // `updates` is an append-only archive. Fall back to older state files
+      // until their next cloud check performs the migration.
+      updates: cloudState.updates || (cloudState.events || []).filter((event) => event.kind === "changed"),
       settings: null,
     };
   }
 
-  async addSite(input: { name: string; url: string; interval_minutes: number }): Promise<void> {
+  async addSite(input: { name: string; url: string; interval_minutes: number; discovery_depth: number }): Promise<void> {
     const parsed = new URL(input.url);
     if (!["http:", "https:"].includes(parsed.protocol)) {
       throw new Error("http:// または https:// から始まるURLを入力してください");
-    }
-    const { sites, sha } = await readSites();
-    if (sites.some((s) => s.url === input.url)) {
-      throw new Error("このURLはすでに登録されています");
     }
     const record: CloudSiteRecord = {
       id: Date.now(),
@@ -359,9 +431,15 @@ export class CloudBackend implements Backend {
       interval_minutes: Math.max(this.minInterval, input.interval_minutes),
       enabled: true,
       urls: [input.url],
-      auto_discover: true,
+      discovery_depth: input.discovery_depth,
+      auto_discover: input.discovery_depth > 0,
     };
-    await writeSites([...sites, record], sha, `add: ${record.name}`);
+    await updateSites(`add: ${record.name}`, (sites) => {
+      if (sites.some((site) => site.url === input.url)) {
+        throw new Error("このURLはすでに登録されています");
+      }
+      return [...sites, record];
+    });
     await dispatchCheck({ only: String(record.id) });
   }
 
@@ -370,12 +448,22 @@ export class CloudBackend implements Backend {
     if (!['http:', 'https:'].includes(parsed.protocol)) {
       throw new Error("http:// または https:// から始まるURLを入力してください");
     }
-    const { sites, sha } = await readSites();
-    const next = sites.map((record) => record.id === site.id ? {
+    await updateSites(`add page: ${site.name}`, (sites) => sites.map((record) => record.id === site.id ? {
       ...record,
       urls: Array.from(new Set([...(record.urls?.length ? record.urls : [record.url]), url])),
-    } : record);
-    await writeSites(next, sha, `add page: ${site.name}`);
+      discovered_urls: Array.from(new Set([...(record.discovered_urls?.length ? record.discovered_urls : (record.urls?.length ? record.urls : [record.url])), url])),
+    } : record));
+    await dispatchCheck({ only: String(site.id) });
+  }
+
+  async setPages(site: Site, urls: string[]): Promise<void> {
+    const selected = Array.from(new Set([site.url, ...urls]));
+    const candidates = Array.from(new Set([site.url, ...site.discovered_urls]));
+    await updateSites(`select pages: ${site.name}`, (sites) => sites.map((record) => record.id === site.id ? {
+      ...record,
+      urls: selected,
+      discovered_urls: record.discovered_urls?.length ? record.discovered_urls : candidates,
+    } : record));
     await dispatchCheck({ only: String(site.id) });
   }
 
@@ -390,27 +478,24 @@ export class CloudBackend implements Backend {
   }
 
   async toggleSite(site: Site): Promise<void> {
-    const { sites, sha } = await readSites();
-    const next = sites.map((s) => (s.id === site.id ? { ...s, enabled: !site.enabled } : s));
-    await writeSites(next, sha, `${site.enabled ? "pause" : "resume"}: ${site.name}`);
+    await updateSites(`${site.enabled ? "pause" : "resume"}: ${site.name}`, (sites) =>
+      sites.map((record) => (record.id === site.id ? { ...record, enabled: !site.enabled } : record)),
+    );
   }
 
   async deleteSite(site: Site): Promise<void> {
-    const { sites, sha } = await readSites();
-    await writeSites(sites.filter((s) => s.id !== site.id), sha, `remove: ${site.name}`);
+    await updateSites(`remove: ${site.name}`, (sites) => sites.filter((record) => record.id !== site.id));
   }
 
   async setInterval(site: Site, minutes: number): Promise<void> {
-    const { sites, sha } = await readSites();
-    const next = sites.map((s) =>
-      s.id === site.id ? { ...s, interval_minutes: Math.max(this.minInterval, minutes) } : s,
-    );
-    await writeSites(next, sha, `interval: ${site.name} -> ${minutes}min`);
+    await updateSites(`interval: ${site.name} -> ${minutes}min`, (sites) => sites.map((record) =>
+      record.id === site.id ? { ...record, interval_minutes: Math.max(this.minInterval, minutes) } : record,
+    ));
   }
 
   async renameSite(site: Site, name: string): Promise<void> {
-    const { sites, sha } = await readSites();
-    const next = sites.map((s) => (s.id === site.id ? { ...s, name } : s));
-    await writeSites(next, sha, `rename: ${site.name} -> ${name}`);
+    await updateSites(`rename: ${site.name} -> ${name}`, (sites) =>
+      sites.map((record) => (record.id === site.id ? { ...record, name } : record)),
+    );
   }
 }

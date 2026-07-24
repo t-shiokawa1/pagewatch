@@ -78,15 +78,21 @@ def is_due(site: Dict[str, Any], entry: Dict[str, Any]) -> bool:
 
 def add_event(state: Dict[str, Any], site: Dict[str, Any], kind: str, summary: str) -> None:
     events: List[Dict[str, Any]] = state.setdefault("events", [])
-    next_id = 1 + max((e.get("id", 0) for e in events), default=0)
-    events.insert(0, {
+    updates: List[Dict[str, Any]] = state.setdefault("updates", [])
+    next_id = 1 + max((e.get("id", 0) for e in [*events, *updates]), default=0)
+    event = {
         "id": next_id,
         "site_id": site["id"],
         "site_name": site.get("name") or site["url"],
         "kind": kind,
         "summary": summary,
         "created_at": now_iso(),
-    })
+    }
+    events.insert(0, event)
+    # The activity feed is deliberately short, but a detected update and its
+    # diff are permanent history. Never let routine checks hide that content.
+    if kind == "changed":
+        updates.insert(0, event.copy())
     del events[MAX_EVENTS:]
 
 
@@ -154,7 +160,21 @@ def check_one(site: Dict[str, Any], entry: Dict[str, Any], state: Dict[str, Any]
     else:
         outcome = "unchanged"
         summary = ""
-    entry.update(status=outcome, last_checked=checked_at, last_error=errors[0] if errors else None, pages=pages)
+    checks = entry.get("checks")
+    if not isinstance(checks, list):
+        checks = []
+    checks.insert(0, {
+        "checked_at": checked_at,
+        "status": outcome,
+        "page_count": len(site_urls(site)),
+    })
+    entry.update(
+        status=outcome,
+        last_checked=checked_at,
+        last_error=errors[0] if errors else None,
+        pages=pages,
+        checks=checks[:server.MAX_CHECK_HISTORY],
+    )
     if outcome == "changed":
         entry["last_changed"] = checked_at
     if outcome in {"changed", "baseline", "error"}:
@@ -185,6 +205,14 @@ def main() -> int:
     state: Dict[str, Any] = load_json(data_dir / "state.json", {})
     state.setdefault("sites", {})
     state.setdefault("events", [])
+    # Migrate history created before the dedicated update archive existed.
+    # Older cloud files can only contribute the changes that were still in the
+    # previous 100-item activity feed; future detected updates are unbounded.
+    if not isinstance(state.get("updates"), list):
+        state["updates"] = [
+            event for event in state["events"]
+            if isinstance(event, dict) and event.get("kind") == "changed"
+        ]
 
     # Drop state for sites that were deleted from the list.
     known = {str(s["id"]) for s in sites}
@@ -206,9 +234,12 @@ def main() -> int:
             # single-page records must keep their original scope instead of
             # unexpectedly starting to monitor every navigation link.
             try:
-                site["urls"] = server.discover_internal_urls(site["url"])
+                discovered = server.discover_internal_urls(site["url"], int(site.get("discovery_depth", 0)))
+                site["discovered_urls"] = discovered
+                site["urls"] = discovered
             except Exception:
                 site["urls"] = [site["url"]]
+                site["discovered_urls"] = [site["url"]]
         elif not site.get("urls"):
             site["urls"] = [site["url"]]
         results.append((site.get("name") or site["url"], check_one(site, entry, state, mail)))

@@ -40,6 +40,7 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 LOG_PATH = DATA_DIR / "pagewatch.log"
 HOST = "127.0.0.1"
 PORT = 8765
+APP_VERSION = "1.2.7"
 USER_AGENT = "PageWatch/1.0 (local personal website monitor)"
 DEFAULT_ALLOWED_ORIGINS = {
     "https://t-shiokawa1.github.io",
@@ -49,6 +50,8 @@ DEFAULT_ALLOWED_ORIGINS = {
 MAX_PAGE_BYTES = 10 * 1024 * 1024
 MAX_DISCOVERED_PAGES = 40
 DISCOVERY_DEPTH = 2
+MAX_CHECK_HISTORY = 20
+SCHEDULER_POLL_SECONDS = 5
 CHECK_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
 
@@ -98,7 +101,10 @@ def init_database() -> None:
                 content_hash TEXT,
                 snapshot TEXT,
                 urls_json TEXT,
+                discovered_urls_json TEXT,
+                discovery_depth INTEGER NOT NULL DEFAULT 0,
                 page_states_json TEXT,
+                check_history_json TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -118,8 +124,14 @@ def init_database() -> None:
         columns = {row[1] for row in db.execute("PRAGMA table_info(sites)")}
         if "urls_json" not in columns:
             db.execute("ALTER TABLE sites ADD COLUMN urls_json TEXT")
+        if "discovered_urls_json" not in columns:
+            db.execute("ALTER TABLE sites ADD COLUMN discovered_urls_json TEXT")
+        if "discovery_depth" not in columns:
+            db.execute("ALTER TABLE sites ADD COLUMN discovery_depth INTEGER NOT NULL DEFAULT 0")
         if "page_states_json" not in columns:
             db.execute("ALTER TABLE sites ADD COLUMN page_states_json TEXT")
+        if "check_history_json" not in columns:
+            db.execute("ALTER TABLE sites ADD COLUMN check_history_json TEXT")
         count = db.execute("SELECT COUNT(*) FROM sites").fetchone()[0]
         if count == 0:
             db.execute(
@@ -360,13 +372,14 @@ def extract_internal_links(html_text: str, base_url: str) -> List[str]:
     return parser.links
 
 
-def discover_internal_urls(root_url: str) -> List[str]:
+def discover_internal_urls(root_url: str, max_depth: int = DISCOVERY_DEPTH) -> List[str]:
     """Find a small set of same-origin HTML pages for a newly added site.
 
     A link alone is not enough to become a monitor target: navigation often
     includes feeds, downloads, stale links, and other non-HTML resources.
     Candidates therefore have to be fetched successfully as HTML first.
     """
+    max_depth = max(0, min(DISCOVERY_DEPTH, int(max_depth)))
     root = canonical_url(root_url)
     found: List[str] = [root]
     queue: List[Tuple[str, int]] = [(root, 0)]
@@ -386,7 +399,7 @@ def discover_internal_urls(root_url: str) -> List[str]:
             found.append(current)
             if len(found) >= MAX_DISCOVERED_PAGES:
                 break
-        if depth >= DISCOVERY_DEPTH:
+        if depth >= max_depth:
             continue
         for link in extract_internal_links(html_text, current):
             if link not in visited and not any(queued == link for queued, _ in queue):
@@ -402,6 +415,16 @@ def site_urls(site: Any) -> List[str]:
         urls = []
     root = canonical_url(site["url"])
     return list(dict.fromkeys([root, *urls]))
+
+
+def discovered_urls(site: Any) -> List[str]:
+    """Return saved discovery candidates, falling back to the monitored URLs."""
+    try:
+        raw = json.loads(site["discovered_urls_json"] or "[]")
+        urls = [canonical_url(str(value)) for value in raw if isinstance(value, str)]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        urls = []
+    return list(dict.fromkeys([canonical_url(site["url"]), *(urls or site_urls(site))]))
 
 
 def page_states(site: Any) -> Dict[str, Dict[str, Any]]:
@@ -423,6 +446,26 @@ def page_states(site: Any) -> Dict[str, Dict[str, Any]]:
             }
         }
     return {}
+
+
+def check_history(site: Any) -> List[Dict[str, Any]]:
+    try:
+        raw = json.loads(site["check_history_json"] or "[]")
+        if isinstance(raw, list):
+            saved = [item for item in raw if isinstance(item, dict)][:MAX_CHECK_HISTORY]
+            if saved:
+                return saved
+    except (KeyError, TypeError, json.JSONDecodeError):
+        pass
+    # The releases before check history only stored the most recent time.
+    # Preserve that real check as the first history item during migration.
+    if site["last_checked"]:
+        return [{
+            "checked_at": site["last_checked"],
+            "status": site["status"],
+            "page_count": len(site_urls(site)),
+        }]
+    return []
 
 
 def decode_page(raw: bytes, content_type: str) -> str:
@@ -478,7 +521,7 @@ def http_error_message(code: int) -> str:
     if code in (401, 403):
         return (
             f"HTTP {code}: このサイトはボット対策で自動アクセスを拒否しています。"
-            "ブラウザ以外からの取得を許可していないため、PageWatchでは監視できません"
+            "ブラウザ以外からの取得を許可していないため、PageWatchではモニターできません"
             "（相手サイトの仕様で、設定を変えても回避できません）。"
         )
     if code == 404:
@@ -619,7 +662,7 @@ def check_site(site_id: int) -> Dict[str, Any]:
         with db_connect() as db:
             site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
             if site is None:
-                raise KeyError("監視サイトが見つかりません")
+                raise KeyError("モニターサイトが見つかりません")
             db.execute("UPDATE sites SET status = 'checking', last_error = NULL WHERE id = ?", (site_id,))
 
         try:
@@ -688,18 +731,27 @@ def check_site(site_id: int) -> Dict[str, Any]:
                 status = "unchanged"
                 summary = ""
 
+            history = check_history(site)
+            history.insert(0, {
+                "checked_at": checked_at,
+                "status": status,
+                "page_count": len(urls),
+            })
+            history = history[:MAX_CHECK_HISTORY]
             with db_connect() as db:
                 db.execute(
                     """
                     UPDATE sites SET status = ?, last_checked = ?,
                         last_changed = CASE WHEN ? = 'changed' THEN ? ELSE last_changed END,
-                        last_error = ?, page_states_json = ?
+                        last_error = ?, page_states_json = ?, check_history_json = ?
                     WHERE id = ?
                     """,
                     (
                         status, checked_at, status, checked_at,
                         errors[0] if errors else None,
-                        json.dumps(states, ensure_ascii=False), site_id,
+                        json.dumps(states, ensure_ascii=False),
+                        json.dumps(history, ensure_ascii=False),
+                        site_id,
                     ),
                 )
                 if status in {"changed", "baseline", "error"}:
@@ -716,9 +768,19 @@ def check_site(site_id: int) -> Dict[str, Any]:
         except Exception as exc:
             logging.exception("Check failed for site %s", site_id)
             with db_connect() as db:
+                failed_at = now_iso()
+                history = check_history(site)
+                history.insert(0, {
+                    "checked_at": failed_at,
+                    "status": "error",
+                    "page_count": len(site_urls(site)),
+                })
                 db.execute(
-                    "UPDATE sites SET status = 'error', last_checked = ?, last_error = ? WHERE id = ?",
-                    (now_iso(), str(exc)[:500], site_id),
+                    """
+                    UPDATE sites SET status = 'error', last_checked = ?, last_error = ?,
+                        check_history_json = ? WHERE id = ?
+                    """,
+                    (failed_at, str(exc)[:500], json.dumps(history[:MAX_CHECK_HISTORY]), site_id),
                 )
                 add_event(db, site_id, "error", f"確認に失敗しました: {str(exc)[:500]}")
             raise RuntimeError(str(exc)) from exc
@@ -744,9 +806,12 @@ def discover_and_check(site_id: int) -> None:
         site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
     if site is None:
         return
-    discovered = discover_internal_urls(site["url"])
+    discovered = discover_internal_urls(site["url"], site["discovery_depth"])
     with db_connect() as db:
-        db.execute("UPDATE sites SET urls_json = ? WHERE id = ?", (json.dumps(discovered), site_id))
+        db.execute(
+            "UPDATE sites SET urls_json = ?, discovered_urls_json = ? WHERE id = ?",
+            (json.dumps(discovered), json.dumps(discovered), site_id),
+        )
     check_site(site_id)
 
 
@@ -759,21 +824,50 @@ def parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def run_scheduler_cycle(now: Optional[datetime] = None) -> List[int]:
+    """Run every site whose interval has elapsed and return the checked IDs.
+
+    Keeping one cycle separate from the thread loop makes the cadence testable
+    and prevents an unexpected database error from permanently killing the
+    background scheduler.
+    """
+    current = now or datetime.now(timezone.utc)
+    with db_connect() as db:
+        sites = db.execute(
+            "SELECT id, interval_minutes, last_checked FROM sites WHERE enabled = 1 ORDER BY id"
+        ).fetchall()
+    checked: List[int] = []
+    for site in sites:
+        last_checked = parse_iso(site["last_checked"])
+        due = last_checked is None or (
+            current - last_checked
+        ).total_seconds() >= site["interval_minutes"] * 60
+        if not due:
+            continue
+        try:
+            check_site(site["id"])
+            checked.append(site["id"])
+            logging.info("Scheduled check completed for site %s", site["id"])
+        except RuntimeError as exc:
+            # A manual check can briefly hold the shared lock. The next cycle
+            # retries the still-due site instead of losing its schedule.
+            logging.warning("Scheduled check deferred for site %s: %s", site["id"], exc)
+        except Exception:
+            logging.exception("Scheduled check failed for site %s", site["id"])
+    return checked
+
+
 def scheduler_loop() -> None:
-    time.sleep(2)
+    if STOP_EVENT.wait(2):
+        return
     while not STOP_EVENT.is_set():
-        now = datetime.now(timezone.utc)
-        with db_connect() as db:
-            sites = db.execute("SELECT id, interval_minutes, last_checked FROM sites WHERE enabled = 1").fetchall()
-        for site in sites:
-            last_checked = parse_iso(site["last_checked"])
-            due = last_checked is None or (now - last_checked).total_seconds() >= site["interval_minutes"] * 60
-            if due:
-                try:
-                    check_site(site["id"])
-                except RuntimeError:
-                    pass
-        STOP_EVENT.wait(30)
+        try:
+            run_scheduler_cycle()
+        except Exception:
+            # Never let one transient SQLite/read failure stop every future
+            # scheduled check.
+            logging.exception("Scheduler cycle failed")
+        STOP_EVENT.wait(SCHEDULER_POLL_SECONDS)
 
 
 def site_rows() -> List[Dict[str, Any]]:
@@ -782,7 +876,8 @@ def site_rows() -> List[Dict[str, Any]]:
             """
             SELECT id, name, url, interval_minutes, enabled, status, last_checked,
                    last_changed, last_error, etag, last_modified, content_hash, snapshot,
-                   urls_json, page_states_json, created_at
+                   urls_json, discovered_urls_json, discovery_depth, page_states_json,
+                   check_history_json, created_at
             FROM sites ORDER BY enabled DESC, created_at DESC
             """
         ).fetchall()
@@ -791,7 +886,9 @@ def site_rows() -> List[Dict[str, Any]]:
         item = dict(row)
         urls = site_urls(row)
         item["urls"] = urls
+        item["discovered_urls"] = discovered_urls(row)
         item["page_count"] = len(urls)
+        item["checks"] = check_history(row)
         result.append(item)
     return result
 
@@ -811,6 +908,25 @@ def event_rows(limit: int = 50) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def update_rows() -> List[Dict[str, Any]]:
+    """Return every detected content change, including its readable diff.
+
+    Check and error activity is intentionally kept separate from this history:
+    an update must never disappear merely because later checks had no change.
+    """
+    with db_connect() as db:
+        rows = db.execute(
+            """
+            SELECT events.id, events.site_id, events.kind, events.summary, events.created_at,
+                   sites.name AS site_name, sites.url AS site_url
+            FROM events JOIN sites ON sites.id = events.site_id
+            WHERE events.kind = 'changed'
+            ORDER BY events.created_at DESC, events.id DESC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def app_state() -> Dict[str, Any]:
     sites = site_rows()
     summary = {
@@ -820,15 +936,17 @@ def app_state() -> Dict[str, Any]:
         "errors": sum(1 for site in sites if site["status"] == "error"),
     }
     return {
+        "version": APP_VERSION,
         "summary": summary,
         "sites": sites,
         "events": event_rows(),
+        "updates": update_rows(),
         "settings": public_settings(),
     }
 
 
 class PageWatchHandler(BaseHTTPRequestHandler):
-    server_version = "PageWatch/1.0"
+    server_version = f"PageWatch/{APP_VERSION}"
 
     def log_message(self, format_string: str, *args: Any) -> None:
         logging.info("%s - %s", self.address_string(), format_string % args)
@@ -891,7 +1009,7 @@ class PageWatchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/api/health":
-            self.send_json({"ok": True, "time": now_iso()})
+            self.send_json({"ok": True, "version": APP_VERSION, "time": now_iso()})
             return
         if path == "/api/state":
             self.send_json(app_state())
@@ -912,14 +1030,15 @@ class PageWatchHandler(BaseHTTPRequestHandler):
                     raise ValueError("http:// または https:// から始まるURLを入力してください")
                 name = str(data.get("name", "")).strip() or parsed.netloc
                 interval = max(5, min(1440, int(data.get("interval_minutes", 15))))
+                discovery_depth = max(0, min(DISCOVERY_DEPTH, int(data.get("discovery_depth", 0))))
                 try:
                     with db_connect() as db:
                         cursor = db.execute(
                             """
-                            INSERT INTO sites (name, url, interval_minutes, enabled, status, created_at)
-                            VALUES (?, ?, ?, 1, 'waiting', ?)
+                            INSERT INTO sites (name, url, interval_minutes, discovery_depth, enabled, status, created_at)
+                            VALUES (?, ?, ?, ?, 1, 'waiting', ?)
                             """,
-                            (name[:120], url, interval, now_iso()),
+                            (name[:120], canonical_url(url), interval, discovery_depth, now_iso()),
                         )
                         site_id = cursor.lastrowid
                 except sqlite3.IntegrityError as exc:
@@ -941,9 +1060,13 @@ class PageWatchHandler(BaseHTTPRequestHandler):
                 with db_connect() as db:
                     site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
                     if site is None:
-                        raise KeyError("監視サイトが見つかりません")
+                        raise KeyError("モニターサイトが見つかりません")
                     merged = list(dict.fromkeys([*site_urls(site), *urls]))
-                    db.execute("UPDATE sites SET urls_json = ? WHERE id = ?", (json.dumps(merged), site_id))
+                    candidates = list(dict.fromkeys([*discovered_urls(site), *urls]))
+                    db.execute(
+                        "UPDATE sites SET urls_json = ?, discovered_urls_json = ? WHERE id = ?",
+                        (json.dumps(merged), json.dumps(candidates), site_id),
+                    )
                 threading.Thread(target=self.safe_check, args=(site_id,), daemon=True).start()
                 self.send_json({"ok": True, "count": len(merged)})
                 return
@@ -963,7 +1086,7 @@ class PageWatchHandler(BaseHTTPRequestHandler):
             if path.endswith("/check"):
                 site_id = self.route_site_id()
                 if site_id is None:
-                    raise KeyError("監視サイトが見つかりません")
+                    raise KeyError("モニターサイトが見つかりません")
                 result = check_site(site_id)
                 self.send_json({"ok": True, **result})
                 return
@@ -994,7 +1117,7 @@ class PageWatchHandler(BaseHTTPRequestHandler):
         try:
             site_id = self.route_site_id()
             if site_id is None:
-                raise KeyError("監視サイトが見つかりません")
+                raise KeyError("モニターサイトが見つかりません")
             data = self.read_json()
             updates = []
             values: List[Any] = []
@@ -1015,7 +1138,7 @@ class PageWatchHandler(BaseHTTPRequestHandler):
             with db_connect() as db:
                 cursor = db.execute(f"UPDATE sites SET {', '.join(updates)} WHERE id = ?", values)
                 if cursor.rowcount == 0:
-                    raise KeyError("監視サイトが見つかりません")
+                    raise KeyError("モニターサイトが見つかりません")
             self.send_json({"ok": True})
         except KeyError as exc:
             self.send_json({"error": str(exc)}, 404)
@@ -1024,7 +1147,34 @@ class PageWatchHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         try:
-            if urlparse(self.path).path != "/api/settings":
+            path = urlparse(self.path).path
+            page_match = re.fullmatch(r"/api/sites/(\d+)/pages", path)
+            if page_match:
+                data = self.read_json()
+                raw_urls = data.get("urls", [])
+                if not isinstance(raw_urls, list):
+                    raise ValueError("URLの一覧が必要です")
+                urls = []
+                for raw_url in raw_urls:
+                    parsed = urlparse(str(raw_url).strip())
+                    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                        raise ValueError("http:// または https:// から始まるURLを入力してください")
+                    urls.append(canonical_url(str(raw_url).strip()))
+                site_id = int(page_match.group(1))
+                with db_connect() as db:
+                    site = db.execute("SELECT * FROM sites WHERE id = ?", (site_id,)).fetchone()
+                    if site is None:
+                        raise KeyError("モニターサイトが見つかりません")
+                    selected = list(dict.fromkeys([canonical_url(site["url"]), *urls]))
+                    candidates = discovered_urls(site)
+                    db.execute(
+                        "UPDATE sites SET urls_json = ?, discovered_urls_json = ? WHERE id = ?",
+                        (json.dumps(selected), json.dumps(candidates), site_id),
+                    )
+                threading.Thread(target=self.safe_check, args=(site_id,), daemon=True).start()
+                self.send_json({"ok": True, "count": len(selected)})
+                return
+            if path != "/api/settings":
                 self.send_json({"error": "Not found"}, 404)
                 return
             settings = save_settings(self.read_json())
@@ -1040,7 +1190,7 @@ class PageWatchHandler(BaseHTTPRequestHandler):
         with db_connect() as db:
             cursor = db.execute("DELETE FROM sites WHERE id = ?", (site_id,))
         if cursor.rowcount == 0:
-            self.send_json({"error": "監視サイトが見つかりません"}, 404)
+            self.send_json({"error": "モニターサイトが見つかりません"}, 404)
             return
         self.send_json({"ok": True})
 
@@ -1098,7 +1248,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), PageWatchHandler)
     server.allowed_origins = set(args.allowed_origins or DEFAULT_ALLOWED_ORIGINS)  # type: ignore[attr-defined]
     url = f"http://{args.host}:{args.port}"
-    logging.info("PageWatch started at %s", url)
+    logging.info("PageWatch v%s started at %s", APP_VERSION, url)
     if args.open:
         threading.Timer(0.8, lambda: webbrowser.open(args.open_url or url)).start()
     try:

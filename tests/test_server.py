@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime
 from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,27 @@ class VisibleContentTests(unittest.TestCase):
             self.assertEqual(
                 server.discover_internal_urls("https://example.com/"),
                 ["https://example.com/", "https://example.com/good/"],
+            )
+        finally:
+            server.fetch_site = original_fetch
+
+    def test_discovery_depth_can_limit_results_to_the_top_page(self):
+        original_fetch = server.fetch_site
+        pages = {
+            "https://example.com/": ('<a href="/news/">News</a>', {"content_type": "text/html"}),
+            "https://example.com/news/": ('<a href="/news/item/">Item</a>', {"content_type": "text/html"}),
+            "https://example.com/news/item/": ("<p>Item</p>", {"content_type": "text/html"}),
+        }
+        try:
+            server.fetch_site = lambda page: pages[page["url"]]
+            self.assertEqual(server.discover_internal_urls("https://example.com/", 0), ["https://example.com/"])
+            self.assertEqual(
+                server.discover_internal_urls("https://example.com/", 1),
+                ["https://example.com/", "https://example.com/news/"],
+            )
+            self.assertEqual(
+                server.discover_internal_urls("https://example.com/", 2),
+                ["https://example.com/", "https://example.com/news/", "https://example.com/news/item/"],
             )
         finally:
             server.fetch_site = original_fetch
@@ -155,9 +177,111 @@ class DatabaseTests(unittest.TestCase):
             changed = server.check_site(site_id)
             self.assertTrue(changed["changed"])
             self.assertIn("更新後の内容", changed["summary"])
-            self.assertEqual(server.site_rows()[0]["status"], "changed")
+            saved = server.site_rows()[0]
+            self.assertEqual(saved["status"], "changed")
+            self.assertEqual([item["status"] for item in saved["checks"][:2]], ["changed", "baseline"])
+            self.assertEqual(saved["checks"][0]["page_count"], 1)
         finally:
             server.fetch_site = original_fetch
+
+    def test_scheduler_records_every_due_five_minute_check(self):
+        server.init_database()
+        site_id = server.site_rows()[0]["id"]
+        original_fetch = server.fetch_site
+        original_now_iso = server.now_iso
+        clock = ["2026-07-24T02:04:00Z"]
+        try:
+            server.fetch_site = lambda _site: (
+                "<html><body><h1>同じ内容</h1></body></html>",
+                {"etag": "", "last_modified": ""},
+            )
+            server.now_iso = lambda: clock[0]
+            with server.db_connect() as db:
+                db.execute(
+                    "UPDATE sites SET interval_minutes = 5, last_checked = NULL WHERE id = ?",
+                    (site_id,),
+                )
+
+            first = server.run_scheduler_cycle(
+                datetime.fromisoformat("2026-07-24T02:04:00+00:00")
+            )
+            self.assertEqual(first, [site_id])
+
+            clock[0] = "2026-07-24T02:08:00Z"
+            early = server.run_scheduler_cycle(
+                datetime.fromisoformat("2026-07-24T02:08:00+00:00")
+            )
+            self.assertEqual(early, [])
+
+            clock[0] = "2026-07-24T02:09:00Z"
+            second = server.run_scheduler_cycle(
+                datetime.fromisoformat("2026-07-24T02:09:00+00:00")
+            )
+            self.assertEqual(second, [site_id])
+
+            clock[0] = "2026-07-24T02:14:00Z"
+            third = server.run_scheduler_cycle(
+                datetime.fromisoformat("2026-07-24T02:14:00+00:00")
+            )
+            self.assertEqual(third, [site_id])
+
+            saved = server.site_rows()[0]
+            self.assertEqual(
+                [item["checked_at"] for item in saved["checks"][:3]],
+                [
+                    "2026-07-24T02:14:00Z",
+                    "2026-07-24T02:09:00Z",
+                    "2026-07-24T02:04:00Z",
+                ],
+            )
+        finally:
+            server.fetch_site = original_fetch
+            server.now_iso = original_now_iso
+
+    def test_first_history_record_preserves_legacy_last_checked_time(self):
+        server.init_database()
+        site_id = server.site_rows()[0]["id"]
+        original_fetch = server.fetch_site
+        original_now_iso = server.now_iso
+        try:
+            with server.db_connect() as db:
+                db.execute(
+                    """
+                    UPDATE sites
+                    SET last_checked = ?, status = 'unchanged', check_history_json = NULL
+                    WHERE id = ?
+                    """,
+                    ("2026-07-24T02:04:00Z", site_id),
+                )
+            server.fetch_site = lambda _site: (
+                "<html><body><h1>同じ内容</h1></body></html>",
+                {"etag": "", "last_modified": ""},
+            )
+            server.now_iso = lambda: "2026-07-24T02:09:00Z"
+
+            server.check_site(site_id)
+
+            self.assertEqual(
+                [item["checked_at"] for item in server.site_rows()[0]["checks"][:2]],
+                ["2026-07-24T02:09:00Z", "2026-07-24T02:04:00Z"],
+            )
+        finally:
+            server.fetch_site = original_fetch
+            server.now_iso = original_now_iso
+
+    def test_update_history_keeps_every_detected_change_separate_from_activity_feed(self):
+        server.init_database()
+        site_id = server.site_rows()[0]["id"]
+        with server.db_connect() as db:
+            for index in range(60):
+                server.add_event(db, site_id, "changed", f"更新内容 {index}")
+            server.add_event(db, site_id, "error", "確認エラー")
+            server.add_event(db, site_id, "baseline", "比較基準を保存")
+
+        updates = server.update_rows()
+        self.assertEqual(len(updates), 60)
+        self.assertTrue(all(item["kind"] == "changed" for item in updates))
+        self.assertEqual(len(server.app_state()["updates"]), 60)
 
     def test_check_site_ignores_reorder_only_change(self):
         server.init_database()
@@ -208,6 +332,20 @@ class DatabaseTests(unittest.TestCase):
             self.assertIn("New news", result["summary"])
         finally:
             server.fetch_site = original_fetch
+
+    def test_discovered_urls_remain_available_after_a_page_is_unchecked(self):
+        server.init_database()
+        site_id = server.site_rows()[0]["id"]
+        root = "https://fukazawa.icems.kyoto-u.ac.jp/"
+        news = "https://fukazawa.icems.kyoto-u.ac.jp/whats-new/"
+        with server.db_connect() as db:
+            db.execute(
+                "UPDATE sites SET urls_json = ?, discovered_urls_json = ? WHERE id = ?",
+                (f'["{root}"]', f'["{root}", "{news}"]', site_id),
+            )
+        site = server.site_rows()[0]
+        self.assertEqual(site["urls"], [root])
+        self.assertEqual(site["discovered_urls"], [root, news])
 
 
 if __name__ == "__main__":
