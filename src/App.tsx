@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "re
 import {
   AppState,
   Backend,
+  CheckRun,
   CloudBackend,
   EventItem,
   LocalBackend,
@@ -29,6 +30,7 @@ const emptyState: AppState = {
   summary: { total: 0, active: 0, changed: 0, errors: 0 },
   sites: [],
   events: [],
+  updates: [],
   settings: null,
 };
 
@@ -48,6 +50,7 @@ const ADMIN_KEY = "pagewatch-admin";
 const LANG_KEY = "pagewatch-lang";
 const DOWNLOAD_URL = "https://github.com/t-shiokawa1/Page-Watch/archive/refs/heads/main.zip";
 const TOKEN_URL = "https://github.com/settings/personal-access-tokens/new";
+const APP_VERSION = "1.2.7";
 
 type Lang = "ja" | "en";
 
@@ -65,8 +68,19 @@ const T = {
     addKicker: "新規追加",
     addTitle: "サイトを追加",
     fUrl: "サイトURL",
-    pages: (count: number) => `監視ページ ${count}件`,
-    pageUrls: "監視するURL",
+    fDiscovery: "探索する階層",
+    discoveryNone: "探索しない（トップURLのみ）",
+    discoveryOne: "1階層下まで",
+    discoveryTwo: "2階層下まで",
+    pages: (count: number) => `モニターページ ${count}件`,
+    pageUrls: "モニターするURL",
+    pageSelectHint: "選択を保存するまで、モニター対象は変わりません。",
+    pageSelectionCount: (selected: number, total: number) => `モニター中 ${selected} / ${total} ページ`,
+    rootPage: "トップURL（常にモニター）",
+    selectAllPages: "すべて選択",
+    clearChildPages: "子ページを解除",
+    savePageSelection: "選択を保存",
+    savingPageSelection: "保存中",
     pageUrl: "追加するURL",
     addPage: "URLを追加",
     fName: "表示名",
@@ -87,6 +101,26 @@ const T = {
     loadingList: "読み込んでいます",
     emptyList: "最初のモニターサイトを上のフォームから追加してください。",
     lastChecked: "最終確認",
+    nextCheck: "次回確認",
+    checkWaiting: "確認待ち",
+    firstCheckWaiting: "初回確認待ち",
+    checkPlanned: (time: string) => `予定 ${time}`,
+    checkLate: (time: string, delay: string) => `予定 ${time} · ${delay}遅れ`,
+    pausedNextCheck: "一時停止中",
+    checkHistory: "確認履歴",
+    checkHistoryHint: "更新の有無に関係なく、直近20回の確認時刻を記録します。",
+    checkHistoryEmpty: "まだ確認記録がありません。",
+    checkPages: (count: number) => `${count}ページを確認`,
+    checkResult: {
+      baseline: "初回確認",
+      unchanged: "変化なし",
+      changed: "更新を検知",
+      error: "エラー",
+      checking: "確認中",
+    } as Record<string, string>,
+    checkLane: "確認",
+    checksCount: (count: number) => `${count}回`,
+    checkGraphHint: "縦線＝確認、橙＝更新を検知、赤＝エラー",
     checkNow: "今すぐ確認",
     pause: "一時停止",
     resume: "再開",
@@ -107,9 +141,11 @@ const T = {
     subCumulative: "累積の変化量（行数）",
     subHours: "時間帯ごとの変化量（濃さ＝行数）",
     hoursAxis: ["0時", "6時", "12時", "18時", "23時"],
-    histKicker: "最近の動き",
-    histTitle: "更新履歴",
-    histEmpty: "確認結果がここに記録されます。",
+    histKicker: "検出した更新",
+    histTitle: "更新内容（すべて）",
+    histHint: "更新を検出した履歴だけを、古いものを含めてすべて表示します。確認のみ・エラーは確認履歴で確認できます。",
+    histEmpty: "まだ更新は検出されていません。",
+    updatesCount: (count: number) => `全${count}件`,
     evChanged: "更新",
     evError: "エラー",
     evBaseline: "開始",
@@ -147,7 +183,8 @@ const T = {
     tActionErr: "処理に失敗しました",
     tBadUrl: "http:// または https:// で始まるURLを入力してください。",
     tDupUrl: "このURLはすでに登録されています。",
-    tPageAdded: "監視URLを追加しました。比較基準を作成します。",
+    tPageAdded: "モニターURLを追加しました。比較基準を作成します。",
+    tPageSelection: "モニターするURLを更新しました。",
     every: (label: string) => `${label}ごと`,
     // setup: local offline
     loKicker: "はじめに / このMacでモニター",
@@ -226,8 +263,19 @@ const T = {
     addKicker: "Add a watch",
     addTitle: "Add a site",
     fUrl: "Site URL",
+    fDiscovery: "Link depth",
+    discoveryNone: "Do not explore (top URL only)",
+    discoveryOne: "One level below",
+    discoveryTwo: "Two levels below",
     pages: (count: number) => `${count} monitored page${count === 1 ? "" : "s"}`,
     pageUrls: "Monitored URLs",
+    pageSelectHint: "Only checked URLs are monitored. The top URL is always included.",
+    pageSelectionCount: (selected: number, total: number) => `${selected} of ${total} pages monitored`,
+    rootPage: "Top URL (always monitored)",
+    selectAllPages: "Select all",
+    clearChildPages: "Clear child pages",
+    savePageSelection: "Save selection",
+    savingPageSelection: "Saving",
     pageUrl: "URL to add",
     addPage: "Add URL",
     fName: "Display name",
@@ -248,6 +296,26 @@ const T = {
     loadingList: "Loading",
     emptyList: "Add your first site from the form above.",
     lastChecked: "Last checked",
+    nextCheck: "Next check",
+    checkWaiting: "Waiting to check",
+    firstCheckWaiting: "Waiting for first check",
+    checkPlanned: (time: string) => `Planned ${time}`,
+    checkLate: (time: string, delay: string) => `Planned ${time} · ${delay} overdue`,
+    pausedNextCheck: "Paused",
+    checkHistory: "Check history",
+    checkHistoryHint: "Records the 20 most recent checks, whether or not the page changed.",
+    checkHistoryEmpty: "No checks recorded yet.",
+    checkPages: (count: number) => `${count} page${count === 1 ? "" : "s"} checked`,
+    checkResult: {
+      baseline: "First check",
+      unchanged: "No change",
+      changed: "Change found",
+      error: "Error",
+      checking: "Checking",
+    } as Record<string, string>,
+    checkLane: "Checks",
+    checksCount: (count: number) => `${count} check${count === 1 ? "" : "s"}`,
+    checkGraphHint: "tick = check, orange = change found, red = error",
     checkNow: "Check now",
     pause: "Pause",
     resume: "Resume",
@@ -268,9 +336,11 @@ const T = {
     subCumulative: "Cumulative lines changed",
     subHours: "Change volume by hour (darker = more lines)",
     hoursAxis: ["0h", "6h", "12h", "18h", "23h"],
-    histKicker: "Recent activity",
-    histTitle: "Recent updates",
-    histEmpty: "Check results will appear here.",
+    histKicker: "Detected changes",
+    histTitle: "All change details",
+    histHint: "Shows every detected change, including older ones. Checks without a change and errors appear in Check history.",
+    histEmpty: "No changes have been detected yet.",
+    updatesCount: (count: number) => `${count} total`,
     evChanged: "Changed",
     evError: "Error",
     evBaseline: "Started",
@@ -309,6 +379,7 @@ const T = {
     tBadUrl: "Enter a URL that starts with http:// or https://.",
     tDupUrl: "This URL is already registered.",
     tPageAdded: "Monitoring URL added. Creating its comparison baseline.",
+    tPageSelection: "Monitored URLs updated.",
     every: (label: string) => `every ${label}`,
     // setup: local offline
     loKicker: "Get started / This Mac",
@@ -421,6 +492,45 @@ function formatDate(value: string | null, lang: Lang, t: Dict): string {
   }).format(new Date(value));
 }
 
+function formatRelative(value: string | null, lang: Lang, t: Dict): string {
+  if (!value) return t.notChecked;
+  const deltaSeconds = (Date.parse(value) - Date.now()) / 1000;
+  const abs = Math.abs(deltaSeconds);
+  const formatter = new Intl.RelativeTimeFormat(lang === "ja" ? "ja-JP" : "en-US", { numeric: "auto" });
+  if (abs < 60) return formatter.format(Math.round(deltaSeconds), "second");
+  if (abs < 3600) return formatter.format(Math.round(deltaSeconds / 60), "minute");
+  if (abs < 86400) return formatter.format(Math.round(deltaSeconds / 3600), "hour");
+  return formatter.format(Math.round(deltaSeconds / 86400), "day");
+}
+
+function formatDuration(milliseconds: number, lang: Lang): string {
+  const minutes = Math.max(1, Math.round(milliseconds / 60_000));
+  if (minutes < 60) return lang === "ja" ? `${minutes}分` : `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  if (!remainder) return lang === "ja" ? `${hours}時間` : `${hours}h`;
+  return lang === "ja" ? `${hours}時間${remainder}分` : `${hours}h ${remainder}m`;
+}
+
+function nextCheckInfo(site: Site, lang: Lang, t: Dict): { primary: string; detail: string; overdue: boolean } {
+  if (!site.enabled) return { primary: t.pausedNextCheck, detail: "", overdue: false };
+  if (!site.last_checked) return { primary: t.firstCheckWaiting, detail: "", overdue: false };
+  const next = Date.parse(site.last_checked) + site.interval_minutes * 60_000;
+  const scheduledAt = formatDate(new Date(next).toISOString(), lang, t);
+  if (next <= Date.now()) {
+    return {
+      primary: t.checkWaiting,
+      detail: t.checkLate(scheduledAt, formatDuration(Date.now() - next, lang)),
+      overdue: true,
+    };
+  }
+  return {
+    primary: formatRelative(new Date(next).toISOString(), lang, t),
+    detail: t.checkPlanned(scheduledAt),
+    overdue: false,
+  };
+}
+
 function hostname(url: string): string {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -521,6 +631,15 @@ function faviconCandidates(rawUrl: string): string[] {
   }
 }
 
+function pageLabel(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    return url.pathname === "/" ? url.hostname : url.pathname.replace(/\/$/, "") || url.hostname;
+  } catch {
+    return rawUrl;
+  }
+}
+
 // The site's own favicon (never a third-party service, to match the app's
 // "your data stays here" promise). Falls back to the name's first letter.
 function SiteIcon({ site }: { site: Site }) {
@@ -556,7 +675,7 @@ const SERIES_COLORS = ["#ff6b3d", "#3868ff", "#51a53e", "#a24bff", "#e0a400", "#
 
 type Ack = { stamp: string; at: string };
 type ChartView = "lanes" | "cumulative" | "hours";
-const CHART_RANGES = [24, 72, 168, 336]; // hours: 24h / 3d / 7d / 14d
+const CHART_RANGES = [1, 6, 24, 72, 168, 336]; // hours: 1h / 6h / 24h / 3d / 7d / 14d
 
 // How many visible lines a "changed" event touched, parsed from the backend's
 // summary ("追加された内容（N件）" / "なくなった内容（N件）"). Reorder-only
@@ -569,13 +688,71 @@ function eventMagnitude(summary: string): number {
 
 type ChartDatum = { t: number; mag: number };
 type ChartSeries = { id: number; name: string; color: string; points: ChartDatum[] };
+type TimeTick = { ms: number; label: string };
+
+function TimeGrid({ ticks }: { ticks: TimeTick[] }) {
+  const first = ticks[0]?.ms;
+  const last = ticks[ticks.length - 1]?.ms;
+  if (first == null || last == null || first === last) return null;
+  return <>{ticks.slice(1, -1).map((tick) => (
+    <span
+      key={tick.ms}
+      className="time-grid-line"
+      style={{ left: `${((tick.ms - first) / (last - first)) * 100}%` }}
+      aria-hidden="true"
+    />
+  ))}</>;
+}
+
+function ChartAxis({ ticks, cumulative = false }: { ticks: TimeTick[]; cumulative?: boolean }) {
+  return <div className={`chart-axis${cumulative ? " chart-axis-cum" : ""}`}>
+    {ticks.map((tick) => <span key={tick.ms}>{tick.label}</span>)}
+  </div>;
+}
+
+function CheckTimeline({
+  checks,
+  startMs,
+  spanMs,
+  ticks,
+  clock,
+  t,
+}: {
+  checks: CheckRun[];
+  startMs: number;
+  spanMs: number;
+  ticks: TimeTick[];
+  clock: (ms: number) => string;
+  t: Dict;
+}) {
+  const visible = checks
+    .map((check) => ({ ...check, time: Date.parse(check.checked_at) }))
+    .filter((check) => check.time >= startMs && check.time <= startMs + spanMs);
+  return (
+    <div className="check-lane">
+      <span className="check-lane-name">{t.checkLane}</span>
+      <div className="check-lane-strip">
+        <TimeGrid ticks={ticks} />
+        {visible.map((check, index) => (
+          <i
+            key={`${check.checked_at}-${index}`}
+            className={`check-tick check-tick-${check.status}`}
+            style={{ left: `${((check.time - startMs) / spanMs) * 100}%` }}
+            title={`${clock(check.time)} · ${t.checkResult[check.status] || check.status} · ${t.checkPages(check.page_count)}`}
+          />
+        ))}
+      </div>
+      <b className="check-lane-count">{t.checksCount(visible.length)}</b>
+    </div>
+  );
+}
 
 // Change-activity view with switchable shapes (lanes / cumulative / by-hour)
 // and an adjustable time window. "changed" events are the only series we keep.
 // `compact` drops the big header for embedding inside an expanded site row.
-function ActivityChart({ events, t, lang, compact, markTime, markLabel }: { events: EventItem[]; t: Dict; lang: Lang; compact?: boolean; markTime?: number; markLabel?: string }) {
+function ActivityChart({ events, checks, t, lang, compact, markTime, markLabel }: { events: EventItem[]; checks: CheckRun[]; t: Dict; lang: Lang; compact?: boolean; markTime?: number; markLabel?: string }) {
   const [view, setView] = useState<ChartView>("lanes");
-  const [rangeH, setRangeH] = useState(24);
+  const [rangeH, setRangeH] = useState(6);
   const now = Date.now();
   const spanMs = rangeH * HOUR_MS;
   const startMs = now - spanMs;
@@ -607,9 +784,16 @@ function ActivityChart({ events, t, lang, compact, markTime, markLabel }: { even
     return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${pad(d.getMinutes())}`;
   };
   const rangeLabel = (h: number) =>
-    h === 24 ? (lang === "ja" ? "24時間" : "24h") : lang === "ja" ? `${h / 24}日` : `${h / 24}d`;
+    h < 24 ? (lang === "ja" ? `${h}時間` : `${h}h`) : h === 24 ? (lang === "ja" ? "24時間" : "24h") : lang === "ja" ? `${h / 24}日` : `${h / 24}d`;
   const sub = view === "lanes" ? t.subLanes : view === "cumulative" ? t.subCumulative : t.subHours;
   const markInRange = markTime != null && markTime >= startMs && markTime <= now;
+  // Short spans expose minute-level timing. Longer spans still show enough
+  // reference marks to locate a point without relying on hover text alone.
+  const tickCount = rangeH <= 1 ? 4 : rangeH <= 6 ? 6 : rangeH <= 24 ? 6 : 4;
+  const timeTicks: TimeTick[] = Array.from({ length: tickCount + 1 }, (_, index) => {
+    const ms = startMs + (spanMs * index) / tickCount;
+    return { ms, label: index === tickCount ? `${t.nowLabel} ${timeAxis(ms)}` : timeAxis(ms) };
+  });
 
   return (
     <section className={`chart-card${compact ? " chart-card-compact" : ""}`} aria-label={t.chartTitle}>
@@ -643,28 +827,28 @@ function ActivityChart({ events, t, lang, compact, markTime, markLabel }: { even
         </div>
       </div>
 
+      <p className="check-graph-hint">{t.checkGraphHint}</p>
+      <CheckTimeline checks={checks} startMs={startMs} spanMs={spanMs} ticks={timeTicks} clock={clock} t={t} />
+
       {total === 0 ? (
-        <p className="chart-empty">{t.chartEmpty}</p>
+        <>
+          <p className="chart-empty">{t.chartEmpty}</p>
+          {view !== "hours" && <ChartAxis ticks={timeTicks} cumulative={view === "cumulative"} />}
+        </>
       ) : (
         <>
           <p className="chart-sub">
             {sub}
             {markInRange && view !== "hours" && <span className="mark-note"> · {markLabel} {clock(markTime!)}</span>}
           </p>
-          {view === "lanes" && <LaneView series={series} startMs={startMs} spanMs={spanMs} clock={clock} markPct={markInRange ? ((markTime! - startMs) / spanMs) * 100 : null} />}
-          {view === "cumulative" && <CumulativeView series={series} startMs={startMs} spanMs={spanMs} now={now} clock={clock} markTime={markInRange ? markTime! : null} />}
+          {view === "lanes" && <LaneView series={series} startMs={startMs} spanMs={spanMs} ticks={timeTicks} clock={clock} markPct={markInRange ? ((markTime! - startMs) / spanMs) * 100 : null} />}
+          {view === "cumulative" && <CumulativeView series={series} startMs={startMs} spanMs={spanMs} now={now} ticks={timeTicks} clock={clock} markTime={markInRange ? markTime! : null} />}
           {view === "hours" && <HoursView series={series} />}
           {view === "hours" ? (
             <div className="chart-axis chart-axis-hours">
               {t.hoursAxis.map((h, i) => <span key={i}>{h}</span>)}
             </div>
-          ) : (
-            <div className={view === "cumulative" ? "chart-axis chart-axis-cum" : "chart-axis"}>
-              <span>{timeAxis(startMs)}</span>
-              <span>{timeAxis(startMs + spanMs / 2)}</span>
-              <span>{t.nowLabel}</span>
-            </div>
-          )}
+          ) : <ChartAxis ticks={timeTicks} cumulative={view === "cumulative"} />}
         </>
       )}
     </section>
@@ -672,7 +856,7 @@ function ActivityChart({ events, t, lang, compact, markTime, markLabel }: { even
 }
 
 // A: one lane per site, a dot at each detection time, dot area ∝ magnitude.
-function LaneView({ series, startMs, spanMs, clock, markPct }: { series: ChartSeries[]; startMs: number; spanMs: number; clock: (ms: number) => string; markPct?: number | null }) {
+function LaneView({ series, startMs, spanMs, ticks, clock, markPct }: { series: ChartSeries[]; startMs: number; spanMs: number; ticks: TimeTick[]; clock: (ms: number) => string; markPct?: number | null }) {
   const maxMag = Math.max(1, ...series.flatMap((s) => s.points.map((p) => p.mag)));
   return (
     <div className="lane-chart">
@@ -680,6 +864,7 @@ function LaneView({ series, startMs, spanMs, clock, markPct }: { series: ChartSe
         <div className="lane" key={s.id}>
           <span className="lane-name">{s.name}</span>
           <div className="lane-strip">
+            <TimeGrid ticks={ticks} />
             {markPct != null && <span className="lane-mark" style={{ left: `${markPct}%` }} />}
             {s.points.map((p, i) => {
               const d = 7 + 11 * Math.sqrt(p.mag / maxMag);
@@ -700,7 +885,7 @@ function LaneView({ series, startMs, spanMs, clock, markPct }: { series: ChartSe
 }
 
 // D: cumulative lines-changed as a per-site step line.
-function CumulativeView({ series, startMs, spanMs, now, clock, markTime }: { series: ChartSeries[]; startMs: number; spanMs: number; now: number; clock: (ms: number) => string; markTime?: number | null }) {
+function CumulativeView({ series, startMs, spanMs, now, ticks, clock, markTime }: { series: ChartSeries[]; startMs: number; spanMs: number; now: number; ticks: TimeTick[]; clock: (ms: number) => string; markTime?: number | null }) {
   const W = 820, H = 168, padL = 34, padR = 8, padT = 10, padB = 8;
   const totals = series.map((s) => s.points.reduce((a, p) => a + p.mag, 0));
   const yMax = Math.max(1, ...totals);
@@ -716,6 +901,9 @@ function CumulativeView({ series, startMs, spanMs, now, clock, markTime }: { ser
           <line className={`grid-line${f ? " grid-top" : ""}`} x1={padL} y1={yS(yMax * f)} x2={W - padR} y2={yS(yMax * f)} vectorEffect="non-scaling-stroke" />
           <text className="y-label" x={padL - 5} y={yS(yMax * f) + 3} textAnchor="end">{Math.round(yMax * f)}</text>
         </g>
+      ))}
+      {ticks.slice(1, -1).map((tick) => (
+        <line key={tick.ms} className="grid-line grid-vertical" x1={xS(tick.ms)} y1={padT} x2={xS(tick.ms)} y2={H - padB} vectorEffect="non-scaling-stroke" />
       ))}
       {series.map((s) => {
         const pts = [...s.points].sort((a, b) => a.t - b.t);
@@ -817,6 +1005,8 @@ function App() {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [interval, setIntervalValue] = useState(60);
+  const [discoveryDepth, setDiscoveryDepth] = useState(1);
+  const [pageDrafts, setPageDrafts] = useState<Record<number, string[]>>({});
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const cloudDialog = useRef<HTMLDialogElement>(null);
   const [settings, setSettings] = useState<Settings>(emptySettings);
@@ -828,16 +1018,17 @@ function App() {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [pageUrl, setPageUrl] = useState("");
 
-  // Events grouped by site, so each row can show its own trend + history.
-  const eventsBySite = useMemo(() => {
+  // Detected changes are separate from short-lived check/error activity so a
+  // site's complete update content never disappears from its detail view.
+  const updatesBySite = useMemo(() => {
     const map = new Map<number, EventItem[]>();
-    for (const event of state.events) {
+    for (const event of state.updates) {
       const list = map.get(event.site_id);
       if (list) list.push(event);
       else map.set(event.site_id, [event]);
     }
     return map;
-  }, [state.events]);
+  }, [state.updates]);
 
   // "Seen" markers for changed sites, kept per-browser (like the cloud token).
   // We remember which change was acknowledged — the site's last_changed stamp —
@@ -870,7 +1061,7 @@ function App() {
   const updatesSince = (site: Site, sinceIso: string) => {
     if (!sinceIso) return 0;
     const since = Date.parse(sinceIso);
-    return (eventsBySite.get(site.id) ?? []).filter(
+    return (updatesBySite.get(site.id) ?? []).filter(
       (e) => e.kind === "changed" && Date.parse(e.created_at) > since,
     ).length;
   };
@@ -992,7 +1183,7 @@ function App() {
       return;
     }
     run("add", async () => {
-      await backend.addSite({ name, url: trimmedUrl, interval_minutes: interval });
+      await backend.addSite({ name, url: trimmedUrl, interval_minutes: interval, discovery_depth: discoveryDepth });
       setName("");
       setUrl("");
       return backend.kind === "cloud" ? t.tAddCloud : t.tAddLocal;
@@ -1025,6 +1216,37 @@ function App() {
       await backend.addPage(site, value);
       setPageUrl("");
       return t.tPageAdded;
+    });
+  };
+
+  const draftPages = (site: Site) => pageDrafts[site.id] ?? site.urls;
+  const pageSelectionChanged = (site: Site) => {
+    const draft = draftPages(site);
+    return draft.length !== site.urls.length || draft.some((page) => !site.urls.includes(page));
+  };
+  const setPageEnabled = (site: Site, page: string, enabled: boolean) => {
+    const selected = draftPages(site);
+    const next = enabled
+      ? Array.from(new Set([...selected, page]))
+      : selected.filter((url) => url !== page);
+    setPageDrafts((drafts) => ({ ...drafts, [site.id]: next }));
+  };
+  const setAllPages = (site: Site, includeChildren: boolean) => {
+    setPageDrafts((drafts) => ({
+      ...drafts,
+      [site.id]: includeChildren ? site.discovered_urls : [site.url],
+    }));
+  };
+  const savePageSelection = (site: Site) => {
+    const selected = draftPages(site);
+    run(`pages-${site.id}`, async () => {
+      await backend.setPages(site, selected);
+      setPageDrafts((drafts) => {
+        const next = { ...drafts };
+        delete next[site.id];
+        return next;
+      });
+      return t.tPageSelection;
     });
   };
 
@@ -1097,7 +1319,7 @@ function App() {
       <header className="topbar">
         <a className="brand" href="#top" aria-label={t.home}>
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
-          <span>PAGEWATCH</span>
+          <span>PAGEWATCH <small>v{APP_VERSION}</small></span>
         </a>
         <div className="top-actions">
           {isAdmin && (
@@ -1224,6 +1446,14 @@ function App() {
                 ))}
               </select>
             </label>
+            <label className="field field-discovery">
+              <span>{t.fDiscovery}</span>
+              <select value={discoveryDepth} onChange={(event) => setDiscoveryDepth(Number(event.target.value))}>
+                <option value={0}>{t.discoveryNone}</option>
+                <option value={1}>{t.discoveryOne}</option>
+                <option value={2}>{t.discoveryTwo}</option>
+              </select>
+            </label>
             <button className="primary-button" type="submit" disabled={busy === "add"}>
               <span>{busy === "add" ? t.addBtnBusy : t.addBtn}</span><b aria-hidden="true">↗</b>
             </button>
@@ -1259,11 +1489,12 @@ function App() {
             ) : state.sites.length === 0 ? (
               <div className="empty-state">{t.emptyList}</div>
             ) : state.sites.map((site) => {
-              const siteEvents = eventsBySite.get(site.id) ?? [];
+              const siteUpdates = updatesBySite.get(site.id) ?? [];
               const open = expandedId === site.id;
               const toggle = () => setExpandedId(open ? null : site.id);
               const ackAt = lastAckAt(site);
               const sinceCount = updatesSince(site, ackAt);
+              const nextCheck = nextCheckInfo(site, lang, t);
               return (
               <div className="site-group" key={site.id}>
               <article
@@ -1334,8 +1565,16 @@ function App() {
                   {site.last_error && <p className="site-error">{site.last_error}</p>}
                 </div>
                 <div className="site-meta">
-                  <span>{t.lastChecked}</span>
-                  <strong>{formatDate(site.last_checked, lang, t)}</strong>
+                  <div className="check-time-block">
+                    <span>{t.lastChecked}</span>
+                    <strong>{formatRelative(site.last_checked, lang, t)}</strong>
+                    <small>{formatDate(site.last_checked, lang, t)}</small>
+                  </div>
+                  <div className={`next-check-block${nextCheck.overdue ? " next-check-overdue" : ""}`}>
+                    <span>{t.nextCheck}</span>
+                    <strong>{nextCheck.primary}</strong>
+                    {nextCheck.detail && <small>{nextCheck.detail}</small>}
+                  </div>
                   <select
                     className="interval-select"
                     value={site.interval_minutes}
@@ -1356,7 +1595,7 @@ function App() {
                     )}
                   </select>
                 </div>
-                <MiniTrend events={siteEvents} />
+                <MiniTrend events={siteUpdates} />
                 <div className="site-actions">
                   <button
                     onClick={() => run(`check-${site.id}`, () => backend.checkSite(site))}
@@ -1380,12 +1619,51 @@ function App() {
               {open && (
                 <div className="site-detail">
                   <section className="page-manager">
-                    <p className="eyebrow">{t.pageUrls}</p>
+                    <div className="page-manager-heading">
+                      <div>
+                        <p className="eyebrow">{t.pageUrls}</p>
+                        <p className="page-select-hint">{t.pageSelectHint}</p>
+                      </div>
+                      <strong>{t.pageSelectionCount(draftPages(site).length, site.discovered_urls.length)}</strong>
+                    </div>
                     <ul>
-                      {site.urls.map((page) => (
-                        <li key={page}><a href={page} target="_blank" rel="noreferrer">{page}</a></li>
+                      {site.discovered_urls.map((page) => (
+                        <li key={page} className={`page-choice${page === site.url ? " page-root" : ""}`}>
+                          <label>
+                            <input
+                              type="checkbox"
+                              checked={draftPages(site).includes(page)}
+                              disabled={page === site.url || busy === `pages-${site.id}`}
+                              onChange={(event) => setPageEnabled(site, page, event.target.checked)}
+                            />
+                            <span className="page-url-copy">
+                              <a href={page} target="_blank" rel="noreferrer" title={page}>
+                                {page === site.url ? t.rootPage : pageLabel(page)}
+                              </a>
+                              {page !== site.url && <small title={page}>{page}</small>}
+                            </span>
+                          </label>
+                        </li>
                       ))}
                     </ul>
+                    <div className="page-selection-actions">
+                      <div>
+                        <button type="button" className="text-button" onClick={() => setAllPages(site, true)}>
+                          {t.selectAllPages}
+                        </button>
+                        <button type="button" className="text-button" onClick={() => setAllPages(site, false)}>
+                          {t.clearChildPages}
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        onClick={() => savePageSelection(site)}
+                        disabled={!pageSelectionChanged(site) || busy === `pages-${site.id}`}
+                      >
+                        {busy === `pages-${site.id}` ? t.savingPageSelection : t.savePageSelection}
+                      </button>
+                    </div>
                     <form onSubmit={(event) => addPage(event, site)}>
                       <input
                         type="url"
@@ -1401,25 +1679,59 @@ function App() {
                     </form>
                   </section>
                   <ActivityChart
-                    events={siteEvents}
+                    events={siteUpdates}
+                    checks={site.checks}
                     t={t}
                     lang={lang}
                     compact
                     markTime={lastAckAt(site) ? Date.parse(lastAckAt(site)) : undefined}
                     markLabel={t.status.seen}
                   />
+                  <section className="check-history-panel">
+                    <div className="check-history-heading">
+                      <div>
+                        <p className="eyebrow">{t.checkHistory}</p>
+                        <p>{t.checkHistoryHint}</p>
+                      </div>
+                      <strong>{t.checksCount(site.checks.length)}</strong>
+                    </div>
+                    {site.checks.length === 0 ? (
+                      <p className="check-history-empty">{t.checkHistoryEmpty}</p>
+                    ) : (
+                      <div className="check-history-list">
+                        {site.checks.slice(0, 10).map((check, index) => (
+                          <article key={`${check.checked_at}-${index}`}>
+                            <span className={`check-history-mark check-history-${check.status}`} />
+                            <time title={formatDate(check.checked_at, lang, t)}>
+                              <strong>{formatRelative(check.checked_at, lang, t)}</strong>
+                              <small>{formatDate(check.checked_at, lang, t)}</small>
+                            </time>
+                            <span>{t.checkResult[check.status] || check.status}</span>
+                            <small>{t.checkPages(check.page_count)}</small>
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
                   <div className="detail-history">
-                    <p className="eyebrow">{t.detailHistory}</p>
+                    <div className="update-history-heading">
+                      <div>
+                        <p className="eyebrow">{t.histKicker}</p>
+                        <h3>{t.histTitle}</h3>
+                        <p>{t.histHint}</p>
+                      </div>
+                      <strong>{t.updatesCount(siteUpdates.length)}</strong>
+                    </div>
                     <div className="timeline">
-                      {siteEvents.length === 0 ? (
+                      {siteUpdates.length === 0 ? (
                         <p className="timeline-empty">{t.histEmpty}</p>
-                      ) : siteEvents.slice(0, 8).map((item) => (
+                      ) : siteUpdates.map((item) => (
                         <article className="timeline-item" key={item.id}>
                           <span className={`timeline-mark mark-${item.kind}`} />
                           <time>{formatDate(item.created_at, lang, t)}</time>
                           <p>{item.summary}</p>
                           <span className="event-label">
-                            {item.kind === "changed" ? t.evChanged : item.kind === "error" ? t.evError : item.kind === "baseline" ? t.evBaseline : t.evNotify}
+                            {t.evChanged}
                           </span>
                         </article>
                       ))}
